@@ -1,9 +1,9 @@
--- La Passion • ESP (Box 2D static, Instances-only, anti-lag)
--- - Box: Frame + UIStroke (dimensiune fixă, centrat pe HRP)
--- - Name/Distance: TextLabel
--- - Tracer: Frame rotit (optimizat)
--- - TeamCheck: PERMANENT ON (fără buton)
--- - FPS: write-guard pe UI + smoothing + culling + update rate separat pt. text/tracer
+-- La Passion • ESP (Box 2D fix, mic, 60+ FPS, Instances-only)
+-- • Box: Frame + UIStroke, mărime FIXĂ (nu se scalează cu distanța), centrat pe HRP
+-- • TeamCheck: PERMANENT ON (fără buton) – afișează DOAR inamici
+-- • Poziția box-ului se actualizează în FIECARE CADRU (no throttle), cu write-guard (anti-jitter)
+-- • Text/Tracer au rate reduse ca să nu afecteze FPS
+-- API: Init(cfg, lib, tab) / Destroy()
 
 local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -14,15 +14,16 @@ local Teams      = game:GetService("Teams")
 local LP     = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
--- ============= Helpers =============
+-- ========== Helpers ==========
 local function getUIRoot()
     local ok, ui = pcall(gethui)
     if ok and typeof(ui)=="Instance" and ui:IsA("Instance") then return ui end
     return CoreGui
 end
 
-local function round(v) return (v + (v>=0 and 0.5 or -0.5)) // 1 end
+local function round(n) return (n + (n>=0 and 0.5 or -0.5)) // 1 end
 
+-- Tracer 2D (Frame rotit)
 local function newLine(parent, color, thickness)
     local f = Instance.new("Frame")
     f.Name = "LP_Tracer"
@@ -38,18 +39,17 @@ local function newLine(parent, color, thickness)
 end
 
 local function setLineFast(f, fromV2, toV2, thickness, color, cache)
-    -- scriu doar dacă s-au schimbat
     local dx, dy = toV2.X - fromV2.X, toV2.Y - fromV2.Y
-    local len = math.sqrt(dx*dx + dy*dy)
+    local len = (dx*dx + dy*dy) ^ 0.5
     if len < 1 then
-        if cache.trVis ~= false then f.Visible=false; cache.trVis=false end
+        if cache.trVis ~= false then f.Visible = false; cache.trVis=false end
         return
     end
     local rot = math.deg(math.atan2(dy, dx))
     if thickness and cache.trTh ~= thickness then
         f.Size = UDim2.fromOffset(f.Size.X.Offset, thickness); cache.trTh = thickness
     end
-    if color and (not cache.trCol or cache.trCol.R~=color.R or cache.trCol.G~=color.G or cache.trCol.B~=color.B) then
+    if color and (not cache.trCol or cache.trCol ~= color) then
         f.BackgroundColor3 = color; cache.trCol = color
     end
     if cache.trLen ~= len then
@@ -64,7 +64,7 @@ local function setLineFast(f, fromV2, toV2, thickness, color, cache)
     if cache.trVis ~= true then f.Visible=true; cache.trVis=true end
 end
 
--- team-check robust
+-- Team-check robust (Team / TeamColor / atribute custom / fallback)
 local TEAM_KEYS = {"Team","team","TeamId","TeamNum","Allegiance","Faction","Side"}
 local function normalizeTeamValue(v)
     if typeof(v)=="Instance" then
@@ -111,20 +111,20 @@ local function isEnemy(plr)
     return true
 end
 
--- ============= State =============
+-- ========== State ==========
 local M = {
     Inited=false, Config=nil, Tab=nil,
-    Gui=nil, Conns={}, Packs={}, Cache={}, List={},
-    Loop=nil, Accum=0, Frame=0
+    Gui=nil, Conns={}, Packs={}, List={}, Cache={},
+    Loop=nil, accText=0, accTracer=0, frame=0
 }
 
--- ============= Cache/Track =============
+-- ========== Cache / Track ==========
 local function cacheChar(plr)
     local ch   = plr.Character
     local hum  = ch and ch:FindFirstChildOfClass("Humanoid")
     local hrp  = ch and ch:FindFirstChild("HumanoidRootPart")
     local head = ch and ch:FindFirstChild("Head")
-    M.Cache[plr] = (ch and hum and hrp and head) and {ch=ch, hum=hum, hrp=hrp, head=head} or {ch=nil}
+    M.Cache[plr] = (ch and hum and hrp and head) and {ch=ch,hum=hum,hrp=hrp,head=head} or {ch=nil}
 end
 
 local function ensureGUI()
@@ -138,18 +138,18 @@ local function ensureGUI()
 end
 
 local function ensurePack(plr)
-    local p = M.Packs[plr]; if p then return p end
+    local P = M.Packs[plr]; if P then return P end
     ensureGUI()
     local E = M.Config.ESP
     local orange = E.BoxColor or Color3.fromRGB(255,165,0)
 
-    -- Box fix (Frame + UIStroke)
+    -- BOX mic și fix (implicit 36x60)
     local box = Instance.new("Frame")
     box.Name = "LP_Box"
     box.AnchorPoint = Vector2.new(0.5, 0.5)
     box.Position = UDim2.fromOffset(-9999,-9999)
+    box.Size = UDim2.fromOffset(E.BoxWidthPx or 36, E.BoxHeightPx or 60)  -- mic
     box.BackgroundTransparency = 1
-    box.Size = UDim2.fromOffset(E.BoxWidthPx or 48, E.BoxHeightPx or 78)
     box.Visible = false
     box.ZIndex = 99996
     local stroke = Instance.new("UIStroke")
@@ -159,12 +159,12 @@ local function ensurePack(plr)
     stroke.Parent = box
     box.Parent = M.Gui
 
-    -- Label
+    -- LABEL (Text)
     local lbl = Instance.new("TextLabel")
     lbl.Name = "LP_Label"
     lbl.AnchorPoint = Vector2.new(0.5, 1)
     lbl.Position = UDim2.fromOffset(-9999,-9999)
-    lbl.Size = UDim2.fromOffset(160, 18)
+    lbl.Size = UDim2.fromOffset(140, 16)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.GothamMedium
     lbl.TextScaled = true
@@ -174,20 +174,17 @@ local function ensurePack(plr)
     lbl.ZIndex = 99997
     lbl.Parent = M.Gui
 
-    -- Tracer
+    -- TRACER
     local tr = newLine(M.Gui, E.TracerColor or orange, E.TracerThickness or 1)
 
-    p = {
+    P = {
         Box=box, Stroke=stroke, Label=lbl, Tracer=tr,
-        -- cache UI (evităm scrieri identice)
-        last={ vis=false, posX=nil, posY=nil, labVis=false, labText=nil,
+        last={ vis=false, px=nil, py=nil, labVis=false, labText=nil,
                trVis=false, trTh=nil, trCol=nil, trLen=nil, trPosX=nil, trPosY=nil, trRot=nil },
-        -- smoothing state
-        smX=nil, smY=nil
     }
-    M.Packs[plr] = p
+    M.Packs[plr] = P
     table.insert(M.List, plr)
-    return p
+    return P
 end
 
 local function untrack(plr)
@@ -212,8 +209,7 @@ local function track(plr)
     table.insert(M.Conns, plr:GetPropertyChangedSignal("Neutral"):Connect(function() end))
 end
 
--- ============= Loop =============
-local TARGET_DT = 1/60 -- 60Hz pentru poziții (smooth)
+-- ========== Loop ==========
 local function anyOn()
     local E = M.Config.ESP
     return E.EnabledBox or E.ShowName or E.ShowDistance or E.ShowTracers
@@ -225,32 +221,42 @@ local function hidePack(p)
     if p.last.trVis then p.Tracer.Visible=false; p.last.trVis=false end
 end
 
+function M.Destroy()
+    if M.Loop then pcall(function() M.Loop:Disconnect() end); M.Loop=nil end
+    for _,c in ipairs(M.Conns) do pcall(function() c:Disconnect() end) end
+    M.Conns = {}
+    for plr in pairs(M.Packs) do untrack(plr) end
+    if M.Gui then pcall(function() M.Gui:Destroy() end); M.Gui=nil end
+    M.Packs, M.Cache, M.List = {}, {}, {}
+    M.accText, M.accTracer, M.frame = 0, 0, 0
+end
+
+local TEXT_RATE   = 0.10  -- 10 Hz (text)
+local TRACER_RATE = 1/30  -- ~30 Hz (tracer)
+local MAX_DIST    = 2000  -- culling dur
+local BOX_YOFF    = -2    -- mic offset vertical pentru „agățare” pe torso
+
 local function startLoop()
     if M.Loop then return end
     M.Loop = RunService.RenderStepped:Connect(function(dt)
         if not anyOn() then return end
 
-        M.Accum += dt
-        if M.Accum < TARGET_DT then return end
-        M.Accum = 0
-        M.Frame = (M.Frame + 1) % 120 -- ciclu 2s
+        M.accText   += dt
+        M.accTracer += dt
+        M.frame = (M.frame + 1) % 240
 
         local E = M.Config.ESP
         local camPos = Camera.CFrame.Position
-        local scrW, scrH = Camera.ViewportSize.X, Camera.ViewportSize.Y
-        local originY = (E.TracerOrigin=="Bottom" and scrH) or (E.TracerOrigin=="Center" and scrH*0.5) or (scrH*0.5)
-        local origin = Vector2.new(scrW*0.5, originY)
-        local maxDist = E.MaxDistance or 2000
-        local alpha   = E.SmoothAlpha or 0.35       -- smoothing (0..1)
+        local vw, vh = Camera.ViewportSize.X, Camera.ViewportSize.Y
+        local originY = (E.TracerOrigin=="Bottom" and vh) or (E.TracerOrigin=="Center" and vh*0.5) or (vh*0.5)
+        local origin = Vector2.new(vw*0.5, originY)
+        local boxCol = E.BoxColor or Color3.fromRGB(255,165,0)
 
         for i=1,#M.List do
             local plr = M.List[i]
-            local c   = M.Cache[plr]
-            local p   = M.Packs[plr]
-            if not (c and p) then
-                -- re-track dacă e cazul
-                track(plr); c=M.Cache[plr]; p=M.Packs[plr]
-            end
+            local c = M.Cache[plr]
+            local p = M.Packs[plr]
+            if not (c and p) then track(plr); c=M.Cache[plr]; p=M.Packs[plr] end
 
             local ch = c.ch
             local alive = ch and c.hum and c.hrp and c.head and c.hum.Health>0
@@ -259,74 +265,63 @@ local function startLoop()
             if not enemy then
                 hidePack(p)
             else
-                local hrp = c.hrp
-                local v3, onScreen = Camera:WorldToViewportPoint(hrp.Position)
-                if (not onScreen) then
+                local v3, onScreen = Camera:WorldToViewportPoint(c.hrp.Position)
+                if not onScreen then
                     hidePack(p)
                 else
-                    local dist = (camPos - hrp.Position).Magnitude
-                    if dist > maxDist then
+                    local dist = (camPos - c.hrp.Position).Magnitude
+                    if dist > (E.MaxDistance or MAX_DIST) then
                         hidePack(p)
                     else
-                        -- === POSITION & BOX (update la 60Hz, cu smoothing & write-guard) ===
-                        local tx = round(v3.X)
-                        local ty = round(v3.Y)
-
-                        -- smoothing 2D (exponential) – reduce micro-jitter
-                        if not p.smX then p.smX, p.smY = tx, ty
-                        else
-                            p.smX = p.smX + (tx - p.smX) * alpha
-                            p.smY = p.smY + (ty - p.smY) * alpha
-                        end
-                        local px, py = round(p.smX), round(p.smY)
-
+                        -- === BOX FIX (update în fiecare frame) ===
                         if E.EnabledBox then
-                            if p.last.posX ~= px or p.last.posY ~= py then
+                            local px = round(v3.X)
+                            local py = round(v3.Y + BOX_YOFF)
+
+                            if p.last.px ~= px or p.last.py ~= py then
                                 p.Box.Position = UDim2.fromOffset(px, py)
-                                p.last.posX, p.last.posY = px, py
+                                p.last.px, p.last.py = px, py
                             end
                             if not p.last.vis then p.Box.Visible=true; p.last.vis=true end
-                            local col = E.BoxColor or Color3.fromRGB(255,165,0)
-                            if not p.last.boxCol or p.last.boxCol~=col then
-                                p.Stroke.Color = col; p.last.boxCol = col
-                            end
+
+                            if p.Stroke.Color ~= boxCol then p.Stroke.Color = boxCol end
                             local th = E.BoxThickness or 2
-                            if p.last.boxTh ~= th then p.Stroke.Thickness=th; p.last.boxTh=th end
+                            if p.Stroke.Thickness ~= th then p.Stroke.Thickness = th end
                         else
                             if p.last.vis then p.Box.Visible=false; p.last.vis=false end
                         end
 
-                        -- === LABEL (10Hz: o data la 6 frame-uri ≈ 10/s) ===
-                        if (E.ShowName or E.ShowDistance) then
-                            if (M.Frame % 6)==0 then
+                        -- === TEXT (10 Hz) ===
+                        if E.ShowName or E.ShowDistance then
+                            if M.accText >= TEXT_RATE then
                                 local t1 = E.ShowName and plr.Name or ""
                                 local t2 = ""
                                 if E.ShowDistance then
-                                    local d = math.floor(dist+0.5); if d>999 then d=999 end
+                                    local d = math.floor(dist + 0.5); if d>999 then d=999 end
                                     t2 = " ["..d.."m]"
                                 end
-                                local text = t1..t2
-                                if p.last.labText ~= text then
-                                    p.Label.Text = text; p.last.labText = text
+                                local txt = t1..t2
+                                if p.last.labText ~= txt then
+                                    p.Label.Text = txt; p.last.labText = txt
                                 end
+                                M.accText = 0
                             end
-                            local yOff = -(p.Box.Size.Y.Offset/2) - 12
-                            local lpx, lpy = px, py + yOff
-                            if p.last.labX ~= lpx or p.last.labY ~= lpy then
+                            local lpx, lpy = p.last.px, p.last.py - (p.Box.Size.Y.Offset/2) - 10
+                            if p.Label.Position.X.Offset ~= lpx or p.Label.Position.Y.Offset ~= lpy then
                                 p.Label.Position = UDim2.fromOffset(lpx, lpy)
-                                p.last.labX, p.last.labY = lpx, lpy
                             end
                             if not p.last.labVis then p.Label.Visible=true; p.last.labVis=true end
                         else
                             if p.last.labVis then p.Label.Visible=false; p.last.labVis=false end
                         end
 
-                        -- === TRACER (30Hz: o data la 2 frame-uri) ===
+                        -- === TRACER (30 Hz) ===
                         if E.ShowTracers then
-                            if (M.Frame % 2)==0 then
-                                setLineFast(p.Tracer, origin, Vector2.new(px, py), E.TracerThickness or 1, E.TracerColor or (E.BoxColor or Color3.fromRGB(255,165,0)), p.last)
+                            if M.accTracer >= TRACER_RATE then
+                                setLineFast(p.Tracer, origin, Vector2.new(p.last.px or v3.X, p.last.py or v3.Y), E.TracerThickness or 1, E.TracerColor or boxCol, p.last)
+                                M.accTracer = 0
                             end
-                        else
+                        } else
                             if p.last.trVis then p.Tracer.Visible=false; p.last.trVis=false end
                         end
                     end
@@ -342,22 +337,12 @@ local function stopLoopIfIdle()
     for _,p in pairs(M.Packs) do hidePack(p) end
 end
 
--- ============= Public API =============
-function M.Destroy()
-    if M.Loop then pcall(function() M.Loop:Disconnect() end); M.Loop=nil end
-    for _,c in ipairs(M.Conns) do pcall(function() c:Disconnect() end) end
-    M.Conns = {}
-    for plr in pairs(M.Packs) do untrack(plr) end
-    if M.Gui then pcall(function() M.Gui:Destroy() end); M.Gui=nil end
-    M.Packs, M.Cache, M.List = {}, {}, {}
-    M.Accum, M.Frame = 0, 0
-end
-
+-- ========== Public ==========
 function M.Init(cfg, lib, tab)
     if M.Inited then return end
     M.Inited=true; M.Config=cfg; M.Tab=tab
 
-    -- UI
+    -- UI (Obsidian)
     local G = tab:AddLeftGroupbox("ESP (instance)")
     G:AddToggle("EnemyESP", {
         Text="Enemy ESP (Box)", Default=false,
