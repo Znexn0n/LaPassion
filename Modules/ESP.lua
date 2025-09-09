@@ -1,4 +1,4 @@
--- La Passion • ESP (Instances-only) + TeamCheck permanent ON (fără buton)
+-- La Passion • ESP (Instances-only) + TeamCheck permanent ON (detecție robustă)
 -- Box: Highlight (AlwaysOnTop), Name/Dist: BillboardGui (CoreGui/gethui), Tracer: Frame 2D
 -- API: Init(cfg, lib, tab) / Destroy()
 
@@ -6,6 +6,7 @@ local Players    = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace  = game:GetService("Workspace")
 local CoreGui    = game:GetService("CoreGui")
+local Teams      = game:GetService("Teams")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = Workspace.CurrentCamera
@@ -44,37 +45,89 @@ local function setLine(f, fromV2, toV2, thickness, color)
     f.Rotation = math.deg(math.atan2(diff.Y, diff.X))
 end
 
-local function center2DFromHRP(hrp)
-    local v, on = Camera:WorldToViewportPoint(hrp.Position)
-    if not on then return end
-    return Vector2.new(v.X, v.Y)
+-- ========= TeamCheck robust =========
+local TEAM_KEYS = {"Team","team","TeamId","TeamNum","Allegiance","Faction","Side"}
+
+local function normalizeTeamValue(v)
+    -- Întoarce fie obiect Team, fie o cheie comparabilă (string/number)
+    if typeof(v) == "Instance" then
+        if v:IsA("Team") then return v end
+        if v:IsA("ObjectValue") then
+            local vv = v.Value
+            if vv and vv:IsA("Team") then return vv end
+            return vv
+        end
+        if v:IsA("StringValue") or v:IsA("IntValue") or v:IsA("NumberValue") or v:IsA("BoolValue") then
+            return v.Value
+        end
+        return nil
+    end
+    if type(v) == "string" and Teams then
+        local t = Teams:FindFirstChild(v)
+        return t or v
+    end
+    return v
 end
 
--- TeamCheck permanent ON (fără UI)
+local function readCustomTeamQuick(plr)
+    -- 1) Attributes pe Player/Character
+    for _,k in ipairs(TEAM_KEYS) do
+        local a = plr:GetAttribute(k)
+        if a ~= nil then return normalizeTeamValue(a) end
+    end
+    local ch = plr.Character
+    if ch then
+        for _,k in ipairs(TEAM_KEYS) do
+            local a = ch:GetAttribute(k)
+            if a ~= nil then return normalizeTeamValue(a) end
+        end
+        -- 2) ValueObjects directe pe Character sau Player (fără recursie grea)
+        for _,k in ipairs(TEAM_KEYS) do
+            local obj = ch:FindFirstChild(k)
+            if obj then return normalizeTeamValue(obj) end
+        end
+    end
+    for _,k in ipairs(TEAM_KEYS) do
+        local obj = plr:FindFirstChild(k)
+        if obj then return normalizeTeamValue(obj) end
+    end
+    return nil
+end
+
 local function isEnemy(plr)
     if not plr or plr == LocalPlayer then return false end
 
-    -- 1) Team object (cel mai sigur)
-    local a, b = LocalPlayer.Team, plr.Team
-    if a ~= nil and b ~= nil then
-        return a ~= b
+    -- 1) Echipe oficiale
+    local myTeam, hisTeam = LocalPlayer.Team, plr.Team
+    if myTeam ~= nil and hisTeam ~= nil then
+        return myTeam ~= hisTeam
     end
 
-    -- 2) TeamColor (mai vechi / unele jocuri)
-    local ca, cb = LocalPlayer.TeamColor, plr.TeamColor
-    if ca ~= nil and cb ~= nil then
-        return ca ~= cb
+    -- 2) TeamColor
+    local myCol, hisCol = LocalPlayer.TeamColor, plr.TeamColor
+    if myCol ~= nil and hisCol ~= nil then
+        return myCol ~= hisCol
     end
 
-    -- 3) Neutral (fallback: dacă unul e neutral, îl tratăm ca potențial inamic)
-    local na, nb = LocalPlayer.Neutral, plr.Neutral
-    if na ~= nil and nb ~= nil then
-        if na and nb then return true end
-        if na ~= nb then return true end
-        return false
+    -- 3) Atribute/valori custom (string/int/Team)
+    local myCustom = readCustomTeamQuick(LocalPlayer)
+    local hisCustom= readCustomTeamQuick(plr)
+    if myCustom ~= nil and hisCustom ~= nil then
+        return myCustom ~= hisCustom
     end
 
-    -- 4) Fallback final: consideră inamic dacă nu avem date
+    -- 4) Neutral (fallback logic)
+    local myNeu, hisNeu = LocalPlayer.Neutral, plr.Neutral
+    if myNeu ~= nil and hisNeu ~= nil then
+        -- dacă ambii sunt neutrali, nu putem decide → tratăm ca inamici (ca să vezi ceva)
+        if myNeu and hisNeu then return true end
+        -- dacă exact unul e neutral → consideră inamic
+        if myNeu ~= hisNeu then return true end
+        -- altfel amândoi non-neutral dar fără info → consideră inamic
+        return true
+    end
+
+    -- 5) Fallback final: consideră inamic (nu te blochezi niciodată fără ESP)
     return true
 end
 
@@ -178,10 +231,11 @@ local function track(plr)
     ensurePack(plr)
     cacheChar(plr)
     table.insert(M.Buckets[(math.abs(plr.UserId)%4)+1], plr)
+
     table.insert(M.Conns, plr.CharacterAdded:Connect(function()
         task.defer(function() cacheChar(plr) end)
     end))
-    -- reacționează la schimbări de echipă în jocurile care modifică dinamically
+    -- dacă jocul schimbă echipele dinamic, prindem schimbarea
     table.insert(M.Conns, plr:GetPropertyChangedSignal("Team"):Connect(function() end))
     table.insert(M.Conns, plr:GetPropertyChangedSignal("TeamColor"):Connect(function() end))
     table.insert(M.Conns, plr:GetPropertyChangedSignal("Neutral"):Connect(function() end))
