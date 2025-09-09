@@ -1,6 +1,5 @@
--- La Passion • ESP (Instances-only, părinți corecți)
--- Box: Highlight (AlwaysOnTop), Name/Dist: BillboardGui (în CoreGui/gethui), Tracer: Frame 2D
--- TeamCheck: ELIMINAT (OFF permanent)
+-- La Passion • ESP (Instances-only) + TeamCheck permanent ON (fără buton)
+-- Box: Highlight (AlwaysOnTop), Name/Dist: BillboardGui (CoreGui/gethui), Tracer: Frame 2D
 -- API: Init(cfg, lib, tab) / Destroy()
 
 local Players    = game:GetService("Players")
@@ -14,9 +13,7 @@ local Camera      = Workspace.CurrentCamera
 -- ========= Helpers =========
 local function getUIRoot()
     local ok, ui = pcall(gethui)
-    if ok and typeof(ui) == "Instance" and ui:IsA("Instance") then
-        return ui
-    end
+    if ok and typeof(ui) == "Instance" and ui:IsA("Instance") then return ui end
     return CoreGui
 end
 
@@ -47,11 +44,38 @@ local function setLine(f, fromV2, toV2, thickness, color)
     f.Rotation = math.deg(math.atan2(diff.Y, diff.X))
 end
 
--- întoarce centrul 2D al corpului (pt. tracer)
 local function center2DFromHRP(hrp)
     local v, on = Camera:WorldToViewportPoint(hrp.Position)
     if not on then return end
     return Vector2.new(v.X, v.Y)
+end
+
+-- TeamCheck permanent ON (fără UI)
+local function isEnemy(plr)
+    if not plr or plr == LocalPlayer then return false end
+
+    -- 1) Team object (cel mai sigur)
+    local a, b = LocalPlayer.Team, plr.Team
+    if a ~= nil and b ~= nil then
+        return a ~= b
+    end
+
+    -- 2) TeamColor (mai vechi / unele jocuri)
+    local ca, cb = LocalPlayer.TeamColor, plr.TeamColor
+    if ca ~= nil and cb ~= nil then
+        return ca ~= cb
+    end
+
+    -- 3) Neutral (fallback: dacă unul e neutral, îl tratăm ca potențial inamic)
+    local na, nb = LocalPlayer.Neutral, plr.Neutral
+    if na ~= nil and nb ~= nil then
+        if na and nb then return true end
+        if na ~= nb then return true end
+        return false
+    end
+
+    -- 4) Fallback final: consideră inamic dacă nu avem date
+    return true
 end
 
 -- ========= State =========
@@ -94,18 +118,18 @@ local function ensurePack(plr)
 
     local pack = {}
 
-    -- Highlight (PĂRINTE: Workspace)
+    -- Highlight (parent: Workspace)
     local hl = Instance.new("Highlight")
     hl.Name = "LP_Highlight"
     hl.Enabled = false
     hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     hl.FillTransparency   = 1
     hl.OutlineTransparency= 0
-    hl.OutlineColor       = Color3.fromRGB(255,165,0)
+    hl.OutlineColor       = M.Config.ESP.BoxColor
     hl.Parent = Workspace
     pack.Highlight = hl
 
-    -- BillboardGui (PĂRINTE: CoreGui/gethui)
+    -- Billboard (parent: CoreGui/gethui)
     local bbg = Instance.new("BillboardGui")
     bbg.Name = "LP_BBG"
     bbg.Size = UDim2.new(0, 220, 0, 36)
@@ -127,8 +151,8 @@ local function ensurePack(plr)
     pack.BBG   = bbg
     pack.Label = lbl
 
-    -- Tracer (Frame) în ScreenGui global
-    pack.Tracer = newLine(M.ScreenGui, Color3.fromRGB(255,165,0), 1)
+    -- Tracer (Frame) în ScreenGui
+    pack.Tracer = newLine(M.ScreenGui, M.Config.ESP.TracerColor, M.Config.ESP.TracerThickness)
 
     M.Packs[plr] = pack
     return pack
@@ -157,6 +181,10 @@ local function track(plr)
     table.insert(M.Conns, plr.CharacterAdded:Connect(function()
         task.defer(function() cacheChar(plr) end)
     end))
+    -- reacționează la schimbări de echipă în jocurile care modifică dinamically
+    table.insert(M.Conns, plr:GetPropertyChangedSignal("Team"):Connect(function() end))
+    table.insert(M.Conns, plr:GetPropertyChangedSignal("TeamColor"):Connect(function() end))
+    table.insert(M.Conns, plr:GetPropertyChangedSignal("Neutral"):Connect(function() end))
 end
 
 -- ========= Loop =========
@@ -198,25 +226,25 @@ local function startLoop()
 
             local ch, hum, hrp, head = c.ch, c.hum, c.hrp, c.head
             local alive = ch and hum and hrp and head and hum.Health > 0
+            local enemy = alive and isEnemy(plr)
 
-            if not alive then
+            if not enemy then
                 hidePack(p)
-                if (tick()%8) < 0.02 then cacheChar(plr) end
             else
                 local center3D, onScreen = Camera:WorldToViewportPoint(hrp.Position)
                 if not onScreen then
                     hidePack(p)
                 else
-                    -- BOX (Highlight)
+                    -- BOX (Highlight) – enemy only
                     if E.EnabledBox then
-                        p.Highlight.Adornee       = ch
-                        p.Highlight.OutlineColor  = E.BoxColor
-                        p.Highlight.Enabled       = true
+                        p.Highlight.Adornee      = ch
+                        p.Highlight.OutlineColor = E.BoxColor
+                        p.Highlight.Enabled      = true
                     else
-                        p.Highlight.Enabled       = false
+                        p.Highlight.Enabled      = false
                     end
 
-                    -- NAME/DIST (Billboard)
+                    -- NAME/DIST (Billboard) – enemy only
                     if E.ShowName or E.ShowDistance then
                         p.BBG.Adornee = head
                         local dist = (camPos - hrp.Position).Magnitude
@@ -228,7 +256,7 @@ local function startLoop()
                         p.BBG.Enabled = false
                     end
 
-                    -- TRACER (Frame)
+                    -- TRACER (Frame) – enemy only
                     if E.ShowTracers then
                         setLine(p.Tracer, origin, Vector2.new(center3D.X, center3D.Y), E.TracerThickness, E.TracerColor)
                     else
@@ -263,7 +291,6 @@ function M.Init(cfg, lib, tab)
     M.Inited=true; M.Config=cfg; M.Library=lib; M.Tab=tab
 
     local G = tab:AddLeftGroupbox("ESP (instance)")
-
     G:AddToggle("EnemyESP", {
         Text="Enemy ESP (Box)", Default=false,
         Callback=function(v) cfg.ESP.EnabledBox=v; if v then startLoop() else stopLoopIfIdle() end end
@@ -289,10 +316,15 @@ function M.Init(cfg, lib, tab)
         Callback=function(v) cfg.ESP.TracerOrigin = v end
     })
 
-    -- hook players
+    -- hook players existenți + join/leave
     for _,p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then track(p) end end
     table.insert(M.Conns, Players.PlayerAdded:Connect(function(p) if p~=LocalPlayer then track(p) end end))
     table.insert(M.Conns, Players.PlayerRemoving:Connect(function(p) untrack(p) end))
+
+    -- reacționează când echipa ta se schimbă (ex: round swap)
+    table.insert(M.Conns, LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function() end))
+    table.insert(M.Conns, LocalPlayer:GetPropertyChangedSignal("TeamColor"):Connect(function() end))
+    table.insert(M.Conns, LocalPlayer:GetPropertyChangedSignal("Neutral"):Connect(function() end))
 end
 
 return M
