@@ -1,27 +1,31 @@
--- ESP (enemy-only) • toggles corecte, auto-update players, respawn safe
+-- ESP pe Instances (compat executors): Highlight + BillboardGui + tracer Frame
 -- API: Init(cfg, lib, tab) / Destroy()
 
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local Workspace    = game:GetService("Workspace")
-
-local LocalPlayer  = Players.LocalPlayer
-local Camera       = Workspace.CurrentCamera
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local CoreGui    = game:GetService("CoreGui")
+local LocalPlayer= Players.LocalPlayer
+local Camera     = Workspace.CurrentCamera
 
 local M = {
-    Drawings = {},        -- [player] = {Box,Name,Dist,Tracer}
-    RenderConn = nil,     -- connection la RenderStepped
-    PAdded = nil,         -- Players.PlayerAdded conn
-    PRemoving = nil,      -- Players.PlayerRemoving conn
-    CharConns = {},       -- [player] = RBXScriptConnection
-    Inited = false
+    Inited=false,
+    Conns={},
+    PerPlayer={}, -- [plr] = { Highlight=..., BBG=..., NameLabel=..., Tracer=Frame }
+    ScreenGui=nil, -- container pentru tracere 2D
 }
 
 local Config, Library, Tab
 
--- ============ Helpers ============
+-- ========== Helpers ==========
+local function getUIRoot()
+    -- Folosim gethui() dacă există, altfel CoreGui (cel mai stabil pentru executors)
+    local ok, ui = pcall(gethui)
+    if ok and typeof(ui)=="Instance" and ui:IsA("Instance") then return ui end
+    return CoreGui
+end
 
-local function SameTeam(a, b)
+local function sameTeam(a,b)
     if not a or not b then return false end
     if a == b then return true end
     if a.Team and b.Team then return a.Team == b.Team end
@@ -29,280 +33,244 @@ local function SameTeam(a, b)
     return false
 end
 
-local function IsEnemy(plr, teamCheck)
+local function isEnemy(plr, teamCheck)
     if plr == LocalPlayer then return false end
     if not teamCheck then return true end
-    return not SameTeam(LocalPlayer, plr)
+    return not sameTeam(LocalPlayer, plr)
 end
 
-local function IsHBorProxy(part)
-    if not part or not part:IsA("BasePart") then return true end
-    local n = string.lower(part.Name)
-    if (part.Transparency or 0) >= 0.9 then
-        if n == "humanoidrootpart" or n:find("hb") or n:find("hitbox") or n:find("box") then
-            return true
-        end
+local function getCharBits(plr)
+    local ch = plr.Character
+    if not ch then return end
+    local hum = ch:FindFirstChildOfClass("Humanoid")
+    local hrp = ch:FindFirstChild("HumanoidRootPart")
+    local head= ch:FindFirstChild("Head")
+    if not (ch and hum and hrp and head) then return end
+    if hum.Health <= 0 then return end
+    return ch, hum, hrp, head
+end
+
+-- creează o linie 2D cu Frame
+local function newLine(parent)
+    local f = Instance.new("Frame")
+    f.Name = "LP_Tracer"
+    f.AnchorPoint = Vector2.new(0.5, 0.5)
+    f.Position = UDim2.fromOffset(-1000, -1000)
+    f.Size = UDim2.fromOffset(0, 1)
+    f.BorderSizePixel = 0
+    f.BackgroundColor3 = Config.ESP.TracerColor
+    f.BackgroundTransparency = 0
+    f.ZIndex = 99999
+    f.Parent = parent
+    return f
+end
+
+local function setLine(frame, fromV2, toV2, thickness)
+    local diff = toV2 - fromV2
+    local len = diff.Magnitude
+    if len < 1 then
+        frame.Visible = false
+        return
     end
-    return false
+    local angle = math.deg(math.atan2(diff.Y, diff.X))
+    frame.Visible = true
+    frame.Size = UDim2.fromOffset(len, thickness)
+    frame.Position = UDim2.fromOffset(fromV2.X, fromV2.Y)
+    frame.Rotation = angle
 end
 
-local R6  = { "Head","Torso","Left Arm","Right Arm","Left Leg","Right Leg" }
-local R15 = {
-    "Head","UpperTorso","LowerTorso",
-    "LeftUpperArm","LeftLowerArm","LeftHand",
-    "RightUpperArm","RightLowerArm","RightHand",
-    "LeftUpperLeg","LeftLowerLeg","LeftFoot",
-    "RightUpperLeg","RightLowerLeg","RightFoot"
-}
-
-local function CollectRigParts(char)
-    local t = {}
-    if not char or not char:IsDescendantOf(workspace) then return t end
-    local isR15 = char:FindFirstChild("UpperTorso") or char:FindFirstChild("LowerTorso")
-    local list  = isR15 and R15 or R6
-    for _,name in ipairs(list) do
-        local p = char:FindFirstChild(name)
-        if p and p:IsA("BasePart") and (p.Transparency or 0) < 0.9 and not IsHBorProxy(p) then
-            t[#t+1] = p
-        end
-    end
-    return t
-end
-
-local function ComputeRigBox(char)
-    local parts = CollectRigParts(char)
-    local pad   = Config.ESP.Padding
-    if #parts == 0 then
-        local head = char and char:FindFirstChild("Head")
-        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
-        if head and hrp then
-            local head2D = Camera:WorldToViewportPoint(head.Position)
-            local root2D = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0,3,0))
-            local h = math.abs(head2D.Y - root2D.Y) * 1.5
-            local w = h/2
-            return head2D.X - w/2 - pad, head2D.Y - h - pad, w + 2*pad, h + 2*pad
-        end
-        return nil
-    end
-
-    local minX, minY = math.huge, math.huge
-    local maxX, maxY = -math.huge, -math.huge
-    local any = false
-
-    for _,part in ipairs(parts) do
-        local cf, sz = part.CFrame, part.Size * 0.5
-        local corners = {
-            Vector3.new(-sz.X,-sz.Y,-sz.Z), Vector3.new( sz.X,-sz.Y,-sz.Z),
-            Vector3.new(-sz.X, sz.Y,-sz.Z), Vector3.new( sz.X, sz.Y,-sz.Z),
-            Vector3.new(-sz.X,-sz.Y, sz.Z), Vector3.new( sz.X,-sz.Y, sz.Z),
-            Vector3.new(-sz.X, sz.Y, sz.Z), Vector3.new( sz.X, sz.Y, sz.Z),
-        }
-        for i=1,8 do
-            local v,on = Camera:WorldToViewportPoint((cf * CFrame.new(corners[i])).Position)
-            if on then
-                any = true
-                if v.X < minX then minX = v.X end
-                if v.Y < minY then minY = v.Y end
-                if v.X > maxX then maxX = v.X end
-                if v.Y > maxY then maxY = v.Y end
-            end
-        end
-    end
-
-    if not any then return nil end
-    minX, minY = minX - pad, minY - pad
-    maxX, maxY = maxX + pad, maxY + pad
-    return minX, minY, maxX-minX, maxY-minY
-end
-
--- ============ Drawings per player ============
-
-local function HidePack(g)
-    if not g then return end
-    g.Box.Visible = false
-    g.Name.Visible = false
-    g.Dist.Visible = false
-    g.Tracer.Visible = false
-end
-
-local function NewESPFor(plr)
-    if M.Drawings[plr] then return end
+-- ========== Per-player spawn/despawn ==========
+local function ensurePerPlayer(plr)
+    if M.PerPlayer[plr] then return M.PerPlayer[plr] end
 
     local pack = {}
-    pack.Box    = Drawing.new("Square"); pack.Box.Filled=false; pack.Box.Thickness=2
-    pack.Name   = Drawing.new("Text");   pack.Name.Center=true; pack.Name.Size=16; pack.Name.Outline=true
-    pack.Dist   = Drawing.new("Text");   pack.Dist.Center=true; pack.Dist.Size=14; pack.Dist.Outline=true
-    pack.Tracer = Drawing.new("Line")
 
-    HidePack(pack)
-    M.Drawings[plr] = pack
+    -- Highlight (contur pe model)
+    local hl = Instance.new("Highlight")
+    hl.Name = "LP_Highlight"
+    hl.Enabled = false
+    hl.FillTransparency = 1
+    hl.OutlineTransparency = 0.2
+    hl.OutlineColor = Config.ESP.BoxColor
+    pack.Highlight = hl
 
-    -- Re-apply la respawn
-    if M.CharConns[plr] then M.CharConns[plr]:Disconnect() end
-    M.CharConns[plr] = plr.CharacterAdded:Connect(function()
-        -- nimic special aici, loopul va prinde noul Character
-    end)
-end
+    -- BillboardGui pentru name+distance
+    local bbg = Instance.new("BillboardGui")
+    bbg.Name = "LP_BBG"
+    bbg.AlwaysOnTop = true
+    bbg.Size = UDim2.new(0, 200, 0, 40)
+    bbg.Enabled = false
 
-local function RemoveESPFor(plr)
-    local pack = M.Drawings[plr]; if not pack then return end
-    HidePack(pack)
-    for _,d in pairs(pack) do pcall(function() d:Remove() end) end
-    M.Drawings[plr] = nil
-    if M.CharConns[plr] then pcall(function() M.CharConns[plr]:Disconnect() end); M.CharConns[plr] = nil end
-end
+    local txt = Instance.new("TextLabel")
+    txt.Name = "LP_Label"
+    txt.Size = UDim2.fromScale(1,1)
+    txt.BackgroundTransparency = 1
+    txt.TextColor3 = Color3.new(1,1,1)
+    txt.TextStrokeTransparency = 0.5
+    txt.Text = ""
+    txt.Font = Enum.Font.GothamMedium
+    txt.TextScaled = true
+    txt.Parent = bbg
 
-local function EnsureHooks()
-    if not M.PAdded then
-        for _,p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then NewESPFor(p) end
-        end
-        M.PAdded   = Players.PlayerAdded:Connect(function(p) if p ~= LocalPlayer then NewESPFor(p) end end)
-        M.PRemoving= Players.PlayerRemoving:Connect(function(p) RemoveESPFor(p) end)
+    pack.BBG = bbg
+    pack.NameLabel = txt
+
+    -- Tracer (Frame) în ScreenGui global
+    if not M.ScreenGui then
+        M.ScreenGui = Instance.new("ScreenGui")
+        M.ScreenGui.Name = "LP_ESP_Screen"
+        M.ScreenGui.IgnoreGuiInset = true
+        M.ScreenGui.ResetOnSpawn = false
+        M.ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        M.ScreenGui.Parent = getUIRoot()
     end
+    pack.Tracer = newLine(M.ScreenGui)
+
+    M.PerPlayer[plr] = pack
+    return pack
 end
 
--- ============ Loop management ============
-
-local function SomethingOn()
-    local E = Config.ESP
-    return E.EnabledBox or E.ShowName or E.ShowDistance or E.ShowTracers
+local function removePerPlayer(plr)
+    local p = M.PerPlayer[plr]; if not p then return end
+    pcall(function() p.Highlight:Destroy() end)
+    pcall(function() p.BBG:Destroy() end)
+    pcall(function() p.Tracer:Destroy() end)
+    M.PerPlayer[plr] = nil
 end
 
-local function StartLoop()
-    if M.RenderConn then return end
-    M.RenderConn = RunService.RenderStepped:Connect(function()
-        if not SomethingOn() then return end
+-- ========== Loop principal ==========
+local function updateAll()
+    local showBox   = Config.ESP.EnabledBox
+    local showName  = Config.ESP.ShowName
+    local showDist  = Config.ESP.ShowDistance
+    local showTrace = Config.ESP.ShowTracers
+    local teamCheck = Config.ESP.TeamCheck
 
-        local scrW, scrH = Camera.ViewportSize.X, Camera.ViewportSize.Y
-        local camPos     = Camera.CFrame.Position
-        local E          = Config.ESP
+    local viewW, viewH = Camera.ViewportSize.X, Camera.ViewportSize.Y
+    local originY = (Config.ESP.TracerOrigin == "Bottom" and viewH)
+                 or (Config.ESP.TracerOrigin == "Center" and viewH*0.5)
+                 or (viewH*0.5) -- Crosshair ≈ center
+    local origin = Vector2.new(viewW*0.5, originY)
 
-        for plr, g in pairs(M.Drawings) do
-            local char = plr.Character
-            local hum  = char and char:FindFirstChildOfClass("Humanoid")
-            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    for _,plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local chk, hum, hrp, head = getCharBits(plr)
+            local enemyOK = isEnemy(plr, teamCheck)
+            local pack = ensurePerPlayer(plr)
 
-            local ok   = char and hum and hum.Health > 0 and hrp and char:IsDescendantOf(workspace) and IsEnemy(plr, E.TeamCheck)
-
-            if not ok then
-                HidePack(g)
+            -- default hide
+            if not (chk and enemyOK) then
+                if pack.Highlight then pack.Highlight.Enabled = false end
+                if pack.BBG then pack.BBG.Enabled = false end
+                if pack.Tracer then pack.Tracer.Visible = false end
             else
-                local x,y,w,h = ComputeRigBox(char)
-                if not x or w < E.MinBoxW or h < E.MinBoxH then
-                    HidePack(g)
+                -- Highlight attach
+                if showBox then
+                    pack.Highlight.Adornee = chk
+                    pack.Highlight.OutlineColor = Config.ESP.BoxColor
+                    pack.Highlight.Enabled = true
                 else
-                    -- Box
-                    if E.EnabledBox then
-                        g.Box.Position = Vector2.new(x, y)
-                        g.Box.Size     = Vector2.new(w, h)
-                        g.Box.Color    = E.BoxColor
-                        g.Box.Visible  = true
-                    else
-                        g.Box.Visible  = false
-                    end
+                    pack.Highlight.Enabled = false
+                end
 
-                    -- Name
-                    if E.ShowName then
-                        g.Name.Text     = plr.Name
-                        g.Name.Position = Vector2.new(x + w/2, y - 18)
-                        g.Name.Color    = Color3.new(1,1,1)
-                        g.Name.Visible  = true
-                    else
-                        g.Name.Visible  = false
-                    end
+                -- Name + Distance
+                if showName or showDist then
+                    pack.BBG.Adornee = head
+                    local d = (Camera.CFrame.Position - hrp.Position).Magnitude
+                    local nameStr = showName and plr.Name or ""
+                    local distStr = showDist and (" ["..(d<999 and math.floor(d) or 999).."m]") or ""
+                    pack.NameLabel.Text = nameStr..distStr
+                    pack.BBG.Enabled = true
+                else
+                    pack.BBG.Enabled = false
+                end
 
-                    -- Distance
-                    if E.ShowDistance then
-                        local d = (camPos - hrp.Position).Magnitude
-                        g.Dist.Text     = ("[%dm]"):format(d < 999 and math.floor(d) or 999)
-                        g.Dist.Position = Vector2.new(x + w/2, y + h + 15)
-                        g.Dist.Color    = Color3.fromRGB(150,200,255)
-                        g.Dist.Visible  = true
+                -- Tracer
+                if showTrace then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+                    if onScreen then
+                        setLine(pack.Tracer, origin, Vector2.new(screenPos.X, screenPos.Y), Config.ESP.TracerThickness)
+                        pack.Tracer.BackgroundColor3 = Config.ESP.TracerColor
                     else
-                        g.Dist.Visible  = false
+                        pack.Tracer.Visible = false
                     end
-
-                    -- Tracer
-                    if E.ShowTracers then
-                        local rootV = Camera:WorldToViewportPoint(hrp.Position)
-                        local fx = scrW * 0.5
-                        local fy = (E.TracerOrigin == "Bottom" and scrH)
-                               or (E.TracerOrigin == "Center" and scrH * 0.5)
-                               or (scrH * 0.5) -- Crosshair ~ center
-                        g.Tracer.From      = Vector2.new(fx, fy)
-                        g.Tracer.To        = Vector2.new(rootV.X, rootV.Y)
-                        g.Tracer.Thickness = E.TracerThickness
-                        g.Tracer.Color     = E.TracerColor
-                        g.Tracer.Visible   = true
-                    else
-                        g.Tracer.Visible   = false
-                    end
+                else
+                    pack.Tracer.Visible = false
                 end
             end
         end
-    end)
-end
-
-local function StopLoopAndHide()
-    if M.RenderConn then pcall(function() M.RenderConn:Disconnect() end); M.RenderConn = nil end
-    for _,g in pairs(M.Drawings) do HidePack(g) end
-    if M.PAdded then pcall(function() M.PAdded:Disconnect() end); M.PAdded=nil end
-    if M.PRemoving then pcall(function() M.PRemoving:Disconnect() end); M.PRemoving=nil end
-end
-
-local function RecalcLoopState()
-    if SomethingOn() then
-        EnsureHooks()
-        StartLoop()
-    else
-        StopLoopAndHide()
     end
 end
 
--- ============ Public API ============
+-- ========== Hooks ==========
+local function ensureHooks()
+    -- PlayerAdded
+    table.insert(M.Conns, Players.PlayerAdded:Connect(function(plr)
+        ensurePerPlayer(plr)
+    end))
+    -- PlayerRemoving
+    table.insert(M.Conns, Players.PlayerRemoving:Connect(function(plr)
+        removePerPlayer(plr)
+    end))
+end
 
+local function bindLoop()
+    table.insert(M.Conns, RunService.RenderStepped:Connect(updateAll))
+end
+
+local function clearAll()
+    for _,c in ipairs(M.Conns) do pcall(function() c:Disconnect() end) end
+    M.Conns = {}
+    for plr in pairs(M.PerPlayer) do removePerPlayer(plr) end
+    if M.ScreenGui then pcall(function() M.ScreenGui:Destroy() end); M.ScreenGui=nil end
+end
+
+-- ========== Public API ==========
 function M.Destroy()
-    StopLoopAndHide()
-    for plr in pairs(M.Drawings) do RemoveESPFor(plr) end
+    clearAll()
 end
 
 function M.Init(cfg, lib, tab)
     if M.Inited then return end
     M.Inited, Config, Library, Tab = true, cfg, lib, tab
 
-    local G = Tab:AddLeftGroupbox("ESP")
-
+    -- UI group
+    local G = Tab:AddLeftGroupbox("ESP (Instance)")
     G:AddToggle("EnemyESP", {
-        Text = "Enemy ESP", Default = false,
-        Callback = function(v) Config.ESP.EnabledBox = v; RecalcLoopState() end
+        Text="Enemy ESP (Highlight)", Default=false,
+        Callback=function(v) Config.ESP.EnabledBox = v end
     })
     G:AddToggle("NameESP", {
-        Text = "Show Names", Default = false,
-        Callback = function(v) Config.ESP.ShowName = v; RecalcLoopState() end
+        Text="Show Names", Default=false,
+        Callback=function(v) Config.ESP.ShowName = v end
     })
     G:AddToggle("DistanceESP", {
-        Text = "Show Distance", Default = false,
-        Callback = function(v) Config.ESP.ShowDistance = v; RecalcLoopState() end
+        Text="Show Distance", Default=false,
+        Callback=function(v) Config.ESP.ShowDistance = v end
     })
     G:AddToggle("TracerESP", {
-        Text = "Show Tracers", Default = false,
-        Callback = function(v) Config.ESP.ShowTracers = v; RecalcLoopState() end
+        Text="Show Tracers", Default=false,
+        Callback=function(v) Config.ESP.ShowTracers = v end
     })
     G:AddToggle("TeamCheck", {
-        Text = "Team Check", Default = Config.ESP.TeamCheck,
-        Callback = function(v) Config.ESP.TeamCheck = v end
+        Text="Team Check", Default=Config.ESP.TeamCheck,
+        Callback=function(v) Config.ESP.TeamCheck = v end
     })
     G:AddSlider("TracerThickness", {
-        Text = "Tracer Thickness", Min = 1, Max = 5, Rounding = 0,
-        Default = Config.ESP.TracerThickness,
-        Callback = function(v) Config.ESP.TracerThickness = math.clamp(v, 1, 5) end
+        Text="Tracer Thickness", Default=Config.ESP.TracerThickness, Min=1, Max=6, Rounding=0,
+        Callback=function(v) Config.ESP.TracerThickness = math.clamp(v,1,6) end
     })
     G:AddDropdown("TracerOrigin", {
-        Values={"Bottom","Center","Crosshair"},
-        Default = Config.ESP.TracerOrigin, Multi=false, Text="Tracer Origin",
-        Callback = function(v) Config.ESP.TracerOrigin = v end
+        Values={"Bottom","Center","Crosshair"}, Default=Config.ESP.TracerOrigin, Multi=false, Text="Tracer Origin",
+        Callback=function(v) Config.ESP.TracerOrigin = v end
     })
+
+    -- pregătim entry pentru toți deja prezenți
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then ensurePerPlayer(p) end
+    end
+    ensureHooks()
+    bindLoop()
 end
 
 return M
